@@ -1,14 +1,9 @@
 /**
  * Neovim-embedded editor for pi.
  *
- * Spawns `nvim --embed --clean`, forwards all keystrokes to neovim,
+ * Spawns `nvim --embed`, forwards all keystrokes to neovim,
  * and syncs neovim's buffer/cursor state back to pi's Editor for rendering.
  *
- * - Full neovim keybindings (motions, operators, text objects, macros, …)
- * - Enter on empty last line submits the prompt
- * - ESC in normal mode passes through to pi (agent abort / double-tap cancel)
- * - Ctrl+C / Ctrl+D pass through to pi
- * - Cursor shape changes per mode (bar=insert, block=normal)
  */
 
 import {
@@ -656,11 +651,10 @@ class NvimEditor extends CustomEditor {
     const lines = super.render(width);
     if (lines.length === 0) return lines;
 
-    // Replace ─ with - on border lines (cleaner look)
     const IS_BORDER_LINE = /^([^─]*─){6,}/;
     for (let i = 0; i < lines.length; i++) {
-      if (IS_BORDER_LINE.test(lines[i]!)) {
-        lines[i] = lines[i]!.replace(/─/g, "-");
+      if (this.settings.borderChar !== null && IS_BORDER_LINE.test(lines[i]!)) {
+        lines[i] = lines[i]!.replace(/─/g, this.settings.borderChar);
       }
       // Strip pi's visual block cursor but keep the APC position marker.
       lines[i] = lines[i]!

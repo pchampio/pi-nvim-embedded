@@ -25,5 +25,6 @@
     "insert": "\u001b[6 q",
     "normal": "\u001b[2 q"
   },
-  "nvimInitLua": []
+  "nvimInitLua": [],
+  "borderChar": "-"
 }

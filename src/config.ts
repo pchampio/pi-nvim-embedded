@@ -62,5 +62,6 @@ export async function loadSettings(): Promise<NvimEmbeddedSettings> {
       normal: config.cursor?.normal ?? "\x1b[2 q",
     },
     nvimInitLua: config.nvimInitLua ?? [],
+    borderChar: "borderChar" in config ? (config.borderChar?.length ? config.borderChar[0]! : null) : "-",
   };
 }

@@ -43,6 +43,9 @@ export interface NvimEmbeddedConfigFile {
 
   /** Extra nvim init commands run after boot (Lua strings executed via nvim_exec_lua) */
   nvimInitLua?: string[];
+
+  /** Character to replace ─ with on border lines. If unset, no replacement is done. */
+  borderChar?: string;
 }
 
 /** Resolved settings with all fields guaranteed present. */
@@ -70,4 +73,5 @@ export interface NvimEmbeddedSettings {
   };
 
   nvimInitLua: string[];
+  borderChar: string | null;
 }

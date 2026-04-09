@@ -24,7 +24,7 @@ Spawns `nvim --embed` as a subprocess, forwards all keystrokes via msgpack-RPC, 
 
 ## Installation
 
-### From GitHub
+### From GitHub (recommended)
 
 ```
 pi install git:github.com/pchampio/pi-nvim-embedded
@@ -35,6 +35,27 @@ pi install git:github.com/pchampio/pi-nvim-embedded
 ```
 pi -e git:github.com/pchampio/pi-nvim-embedded
 ```
+
+### Manual install via git clone
+
+Clone the repo into your pi agent directory and add it to `packages` in your `settings.json`:
+
+```bash
+cd ~/.pi/agent
+git clone https://github.com/pchampio/pi-nvim-embedded extensions/pi-nvim-embedded
+```
+
+Then edit `~/.pi/agent/settings.json` (create it if it doesn't exist):
+
+```json
+{
+  "packages": [
+    "extensions/pi-nvim-embedded"
+  ]
+}
+```
+
+Restart pi — the extension will be loaded from the local clone.
 
 ## Configuration
 
@@ -66,6 +87,7 @@ cp config.example.json config.json
 | `cursor.insert` | `string` | `"\x1b[6 q"` | Insert mode cursor shape escape sequence (bar) |
 | `cursor.normal` | `string` | `"\x1b[2 q"` | Normal mode cursor shape escape sequence (block) |
 | `nvimInitLua` | `string[]` | `[]` | Extra Lua commands run after neovim boot (executed via `nvim_exec_lua`) |
+| `borderChar` | `string` | `"-"` | Character used to replace `─` on editor border lines. Set to `""` to keep the original `─` character |
 
 ### Example: disable tmux integration
 
