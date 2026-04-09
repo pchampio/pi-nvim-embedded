@@ -1,5 +1,10 @@
 # pi-nvim-embedded
 
+<p align="center">
+  <img src="https://github.com/user-attachments/assets/2e6541ae-974a-4465-ab62-e47595849136" width="80%"/>
+</p>
+
+
 Embedded neovim editor extension for [pi](https://github.com/badlogic/pi-mono) -- full vim keybindings in the pi coding agent prompt.
 
 Spawns `nvim --embed` as a subprocess, forwards all keystrokes via msgpack-RPC, and syncs neovim's buffer/cursor/mode state back to pi's editor for rendering.
