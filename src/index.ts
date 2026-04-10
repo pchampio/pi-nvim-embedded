@@ -59,6 +59,27 @@ class NvimEditor extends CustomEditor {
   private vEndRow = 0;
   private vEndCol = 0;
 
+  // Popup menu state (from ext_popupmenu or nvim-cmp polling)
+  private pmenuVisible = false;
+  private pmenuItems: [string, string, string, string][] = []; // [word, kind, menu, info]
+  private pmenuSelected = -1;
+  private pmenuSource: "ext" | "cmp" | null = null;
+
+  // Cached highlight colors from neovim (true color ANSI prefixes)
+  private pmenuStyle = { normal: "", selected: "", kindNormal: "", kindSelected: "", reset: "\x1b[0m" };
+  private visualStyle = { on: "\x1b[47m", off: "\x1b[49m" };
+
+  // Ghost text (inline completion virtual text from neovim extmarks)
+  private ghostLines: string[] = [];
+  private ghostPollTimer: ReturnType<typeof setInterval> | null = null;
+  private static readonly GHOST_POLL_MS = 150;
+
+  // Message line (from ext_messages msg_show events)
+  private msgText = "";
+  private msgKind = "";
+  private msgTimer: ReturnType<typeof setTimeout> | null = null;
+  private static readonly MSG_TIMEOUT = 4000;
+
   // Flush synchronization: resolves when neovim finishes processing input.
   private flushResolve: (() => void) | null = null;
 
@@ -68,6 +89,7 @@ class NvimEditor extends CustomEditor {
   } | null;
 
   private readonly settings: NvimEmbeddedSettings;
+  private readonly piCommands: { name: string; description: string }[];
 
   constructor(
     tui: any,
@@ -75,10 +97,12 @@ class NvimEditor extends CustomEditor {
     kb: any,
     colorizers: { insert: (s: string) => string; normal: (s: string) => string } | null,
     settings: NvimEmbeddedSettings,
+    piCommands: { name: string; description: string }[],
   ) {
     super(tui, theme, kb);
     this.colorizers = colorizers;
     this.settings = settings;
+    this.piCommands = piCommands;
     this.boot();
   }
 
@@ -91,8 +115,8 @@ class NvimEditor extends CustomEditor {
       // Low timeoutlen: keys arrive one at a time from our pump, no need to wait
       await this.nvim.request("nvim_set_option_value", ["timeoutlen", this.settings.timeoutlen, {}]);
 
-      // Make it a scratch buffer so plugins (LSP, treesitter, etc.) leave it alone
-      await this.nvim.request("nvim_set_option_value", ["buftype", "nofile", { buf: 0 }]);
+      // Keep buftype empty so LSP clients (Copilot, etc.) can attach.
+      // File-related features are disabled individually instead.
       await this.nvim.request("nvim_set_option_value", ["bufhidden", "hide", { buf: 0 }]);
       await this.nvim.request("nvim_set_option_value", ["swapfile", false, { buf: 0 }]);
       await this.nvim.request("nvim_set_option_value", ["undofile", false, {}]);
@@ -105,8 +129,10 @@ class NvimEditor extends CustomEditor {
       await this.nvim.request("nvim_set_option_value", ["number", false, {}]);
       await this.nvim.request("nvim_set_option_value", ["relativenumber", false, {}]);
       await this.nvim.request("nvim_set_option_value", ["signcolumn", "no", {}]);
-      // Prevent filetype detection from triggering LSP/treesitter
-      await this.nvim.request("nvim_set_option_value", ["filetype", "", { buf: 0 }]);
+      // Force completion popup to always show (even for single match)
+      await this.nvim.request("nvim_set_option_value", ["completeopt", "menu,menuone,noselect", {}]);
+      // Set a neutral filetype so LSP clients (e.g. Copilot) can attach
+      await this.nvim.request("nvim_set_option_value", ["filetype", "text", { buf: 0 }]);
       // Disable features that block or are invisible in embedded mode
       const tmuxClipboard = this.settings.tmux.clipboard;
       const disabledKeysJson = JSON.stringify(this.settings.disabledKeys);
@@ -116,10 +142,9 @@ class NvimEditor extends CustomEditor {
         vim.fn.inputlist = function() return 0 end
         vim.fn.confirm = function() return 1 end
 
-        -- Disable LSP and treesitter for this buffer
+        -- Disable treesitter for this buffer (LSP stays for inline completion)
         vim.api.nvim_create_autocmd({'BufEnter', 'BufNew'}, {
           callback = function(args)
-            pcall(vim.lsp.buf_detach_client, args.buf)
             pcall(vim.treesitter.stop, args.buf)
           end
         })
@@ -173,28 +198,135 @@ class NvimEditor extends CustomEditor {
         await this.nvim.request("nvim_exec_lua", [lua, []]);
       }
 
-      // Attach a UI so neovim processes typeahead and sends flush.
-      // We ignore the grid data — pi's Editor handles rendering.
-      await this.nvim.request("nvim_ui_attach", [80, 24, { ext_linegrid: true }]);
+      // Enable LSP inline completion when a client attaches (Copilot, etc.)
+      await this.nvim.request("nvim_exec_lua", [`
+        if vim.lsp and vim.lsp.inline_completion then
+          vim.api.nvim_create_autocmd('LspAttach', {
+            callback = function(args)
+              pcall(vim.lsp.inline_completion.enable, true, { bufnr = args.buf })
+            end
+          })
+          pcall(vim.lsp.inline_completion.enable, true, { bufnr = 0 })
+        end
+      `, []]);
 
-      // Listen for flush (end of a redraw batch = neovim done processing).
+      // Register nvim-cmp source for pi slash commands
+      const cmdsJson = JSON.stringify(this.piCommands);
+      const cmpSourceLua = [
+        "local ok, cmp = pcall(require, 'cmp')",
+        "if not ok then return end",
+        "local commands = vim.fn.json_decode(...) or {}",
+        "local source = {}",
+        "source.new = function() return setmetatable({}, { __index = source }) end",
+        "function source:get_trigger_characters() return { '/' } end",
+        "function source:get_keyword_pattern() return [[/\\S*]] end",
+        "function source:complete(params, callback)",
+        "  local line = params.context.cursor_before_line",
+        "  if not line:match('^%s*/') then",
+        "    callback({ items = {}, isIncomplete = false })",
+        "    return",
+        "  end",
+        "  local items = {}",
+        "  for _, cmd in ipairs(commands) do",
+        "    items[#items+1] = {",
+        "      label = '/' .. cmd.name,",
+        "      kind = 14,",
+        "      detail = cmd.description or '',",
+        "      filterText = '/' .. cmd.name,",
+        "      sortText = cmd.name,",
+        "    }",
+        "  end",
+        "  callback({ items = items, isIncomplete = false })",
+        "end",
+        "cmp.register_source('pi', source)",
+        "local config = require('cmp.config')",
+        "local global = config.get()",
+        "local sources = global.sources or {}",
+        "table.insert(sources, 1, { name = 'pi' })",
+        "cmp.setup({ sources = sources })",
+      ].join("\n");
+      await this.nvim.request("nvim_exec_lua", [cmpSourceLua, [cmdsJson]]);
+
+      // Attach a UI so neovim processes typeahead and sends flush.
+      await this.nvim.request("nvim_ui_attach", [80, 24, { ext_linegrid: true, ext_popupmenu: true, ext_messages: true }]);
+
+      // Listen for flush and popupmenu events.
       this.nvim.onNotification("redraw", (batches) => {
         for (const batch of batches as unknown[][]) {
-          if (Array.isArray(batch) && batch[0] === "flush") {
+          if (!Array.isArray(batch)) continue;
+          const event = batch[0];
+          if (event === "flush") {
             if (this.flushResolve) {
               const resolve = this.flushResolve;
               this.flushResolve = null;
               resolve();
             }
+          } else if (event === "popupmenu_show") {
+            const args = batch[1] as [unknown[][], number, number, number];
+            this.pmenuItems = (args[0] as unknown[][]).map(
+              (item) => [String(item[0]), String(item[1]), String(item[2]), String(item[3])] as [string, string, string, string],
+            );
+            this.pmenuSelected = args[1] as number;
+            this.pmenuVisible = true;
+            this.pmenuSource = "ext";
+          } else if (event === "popupmenu_select") {
+            const args = batch[1] as [number];
+            this.pmenuSelected = args[0];
+          } else if (event === "popupmenu_hide") {
+            this.pmenuVisible = false;
+            this.pmenuItems = [];
+            this.pmenuSelected = -1;
+            this.pmenuSource = null;
+          } else if (event === "msg_show") {
+            // msg_show: [kind, content_chunks, replace_last]
+            // content_chunks: [[attr_id, text], ...]
+            for (let k = 1; k < batch.length; k++) {
+              const args = batch[k] as [string, unknown[][], boolean];
+              const kind = args[0] ?? "";
+              if (kind === "search_count" || kind === "mode") continue;
+              const chunks = args[1] ?? [];
+              const text = chunks.map((c: unknown[]) => String(c[1] ?? "")).join("").trim();
+              if (text) {
+                this.msgText = text;
+                this.msgKind = kind;
+                if (this.msgTimer) clearTimeout(this.msgTimer);
+                this.msgTimer = setTimeout(() => {
+                  this.msgText = "";
+                  this.msgKind = "";
+                  this.msgTimer = null;
+                  const e = this as unknown as EditorInternals;
+                  e.tui?.requestRender?.();
+                }, NvimEditor.MSG_TIMEOUT);
+              }
+            }
+          } else if (event === "msg_clear") {
+            this.msgText = "";
+            this.msgKind = "";
+            if (this.msgTimer) { clearTimeout(this.msgTimer); this.msgTimer = null; }
           }
         }
       });
 
       // Stay in normal mode (neovim starts in normal by default).
       await this.waitForFlush(100);
+      await this.fetchHighlightColors();
       await this.sync();
 
       this.ready = true;
+
+      // Poll for async ghost text updates (Copilot responds after a delay)
+      this.ghostPollTimer = setInterval(async () => {
+        if (!this.ready || this.busy || this.getMode() !== "insert" || this.pmenuVisible) return;
+        try {
+          const ghost = await this.queryGhostText();
+          if (ghost.length !== this.ghostLines.length || ghost.some((g, i) => g !== this.ghostLines[i])) {
+            this.ghostLines = ghost;
+            const e = this as unknown as EditorInternals;
+            e.tui?.requestRender?.();
+          }
+        } catch {}
+      }, NvimEditor.GHOST_POLL_MS);
+
       // Drain anything queued while booting
       if (this.queue.length > 0) {
         this.pump();
@@ -210,9 +342,64 @@ class NvimEditor extends CustomEditor {
   }
 
   close(): void {
+    if (this.ghostPollTimer) { clearInterval(this.ghostPollTimer); this.ghostPollTimer = null; }
+    if (this.msgTimer) { clearTimeout(this.msgTimer); this.msgTimer = null; }
     this.nvim.close();
-    // Reset cursor to blinking bar (terminal default for most shells)
     process.stdout.write("\x1b[2 q");
+  }
+
+  /** Convert a 24-bit integer color to an ANSI true color sequence. */
+  private static fgColor(c: number): string {
+    return `\x1b[38;2;${(c >> 16) & 0xff};${(c >> 8) & 0xff};${c & 0xff}m`;
+  }
+  private static bgColor(c: number): string {
+    return `\x1b[48;2;${(c >> 16) & 0xff};${(c >> 8) & 0xff};${c & 0xff}m`;
+  }
+
+  /** Fetch highlight colors (Pmenu*, Visual) from neovim for popup and selection rendering. */
+  private async fetchHighlightColors(): Promise<void> {
+    try {
+      const hls = await this.nvim.request("nvim_exec_lua", [`
+        local function get(name)
+          local ok, hl = pcall(vim.api.nvim_get_hl, 0, { name = name, link = false })
+          if not ok then return {} end
+          return { fg = hl.fg, bg = hl.bg, bold = hl.bold, italic = hl.italic, reverse = hl.reverse }
+        end
+        return { get('Pmenu'), get('PmenuSel'), get('PmenuKind'), get('PmenuKindSel'), get('Visual') }
+      `, []]) as { fg?: number; bg?: number; bold?: boolean; italic?: boolean; reverse?: boolean }[];
+
+      const build = (hl: { fg?: number; bg?: number; bold?: boolean; italic?: boolean; reverse?: boolean }) => {
+        let s = "";
+        if (hl.reverse) { s += "\x1b[7m"; return s; }
+        if (hl.bg != null) s += NvimEditor.bgColor(hl.bg);
+        if (hl.fg != null) s += NvimEditor.fgColor(hl.fg);
+        if (hl.bold) s += "\x1b[1m";
+        if (hl.italic) s += "\x1b[3m";
+        return s;
+      };
+
+      this.pmenuStyle = {
+        normal: build(hls[0] ?? {}) || "\x1b[100m",
+        selected: build(hls[1] ?? {}) || "\x1b[7m",
+        kindNormal: build(hls[2] ?? {}) || build(hls[0] ?? {}) || "\x1b[100m",
+        kindSelected: build(hls[3] ?? {}) || build(hls[1] ?? {}) || "\x1b[7m",
+        reset: "\x1b[0m",
+      };
+
+      const vis = hls[4] ?? {};
+      const visOn = build(vis);
+      if (visOn) {
+        this.visualStyle = { on: visOn, off: "\x1b[0m" };
+      }
+    } catch {
+      this.pmenuStyle = {
+        normal: "\x1b[100m",
+        selected: "\x1b[7m",
+        kindNormal: "\x1b[100m",
+        kindSelected: "\x1b[7m",
+        reset: "\x1b[0m",
+      };
+    }
   }
 
   // ── mode helpers ───────────────────────────────────────────────────
@@ -261,7 +448,6 @@ class NvimEditor extends CustomEditor {
     this.queue.push(data);
     if (this.ready && !this.busy) {
       this.pump();
-    } else {
     }
   }
 
@@ -269,7 +455,11 @@ class NvimEditor extends CustomEditor {
   private async pasteText(text: string): Promise<void> {
     if (!this.ready) return;
     try {
-      const lines = text.split(/\r?\n/);
+      // Strip all terminal escape sequences and control chars — tmux buffers can contain styled text
+      const clean = text
+        .replace(/\x1b(?:\[[^\x40-\x7e]*[\x40-\x7e]|\][^\x07]*\x07|.)/g, "")
+        .replace(/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/g, "");
+      const lines = clean.split(/\r?\n/);
       await this.nvim.request("nvim_put", [lines, "c", false, true]);
       await this.waitForFlush(50);
       await this.sync();
@@ -294,7 +484,6 @@ class NvimEditor extends CustomEditor {
       while (this.queue.length > 0) {
         const data = this.queue.shift()!;
 
-
         // ── keys that bypass neovim ──
 
         // Keys that go to pi (editor shortcuts, exit, etc.)
@@ -316,8 +505,8 @@ class NvimEditor extends CustomEditor {
           continue;
         }
 
-        // Keys that go to tmux
-        {
+        // Keys that go to tmux (only in normal mode — insert/visual send to neovim)
+        if (this.isPureNormal()) {
           let tmuxHandled = false;
           for (const [key, args] of Object.entries(TMUX_KEYS)) {
             if (matchesKey(data, key)) {
@@ -420,11 +609,42 @@ class NvimEditor extends CustomEditor {
       if (matchesKey(data, "ctrl+r")) return "\x12";
       if (matchesKey(data, "ctrl+n")) return "\x0e";
       if (matchesKey(data, "ctrl+p")) return "\x10";
+      if (matchesKey(data, "ctrl+h")) return "\x08";
+      if (matchesKey(data, "ctrl+j")) return "\x0a";
+      if (matchesKey(data, "ctrl+k")) return "\x0b";
+      if (matchesKey(data, "ctrl+l")) return "\x0c";
       if (matchesKey(data, "backspace")) return "\x08";
       if (matchesKey(data, "tab")) return "\x09";
       if (matchesKey(data, "shift+tab")) return "\x1b[Z";
     }
     return data;
+  }
+
+  private async queryGhostText(): Promise<string[]> {
+    const ghost = await this.nvim.request("nvim_exec_lua", [`
+      local row = vim.fn.line('.') - 1
+      local marks = vim.api.nvim_buf_get_extmarks(0, -1, {row, 0}, {row + 1, 0}, {details = true})
+      local texts = {}
+      for _, mark in ipairs(marks) do
+        local d = mark[4]
+        local pos = d.virt_text_pos or ''
+        if d.virt_text and #d.virt_text > 0 and (pos == 'inline' or pos == 'overlay') then
+          local s = ''
+          for _, c in ipairs(d.virt_text) do s = s .. c[1] end
+          if #s > 0 then texts[#texts+1] = s end
+        end
+        if d.virt_lines then
+          for _, vl in ipairs(d.virt_lines) do
+            local s = ''
+            for _, c in ipairs(vl) do s = s .. c[1] end
+            if #s > 0 then texts[#texts+1] = s end
+          end
+        end
+      end
+      if #texts == 0 then return nil end
+      return texts
+    `, []]) as string[] | null;
+    return ghost ?? [];
   }
 
   private isEsc(data: string): boolean {
@@ -583,6 +803,61 @@ class NvimEditor extends CustomEditor {
         } catch {}
       }
 
+      // Query ghost text (virtual text at cursor from inline completion / copilot / etc.)
+      if (this.getMode() === "insert") {
+        try {
+          this.ghostLines = await this.queryGhostText();
+        } catch {
+          this.ghostLines = [];
+        }
+      } else {
+        this.ghostLines = [];
+      }
+
+      // Poll nvim-cmp popup state (if nvim-cmp is installed)
+      try {
+        const cmpState = await this.nvim.request("nvim_exec_lua", [`
+          local ok, cmp = pcall(require, 'cmp')
+          if not ok or not cmp.visible() then return nil end
+          local entries = cmp.get_entries()
+          if #entries == 0 then return nil end
+          local items = {}
+          for _, entry in ipairs(entries) do
+            local ci = entry:get_completion_item()
+            local kind = ''
+            if ci.kind then
+              local names = vim.lsp.protocol.CompletionItemKind
+              if type(names) == 'table' then kind = names[ci.kind] or '' end
+            end
+            table.insert(items, {ci.label or '', kind, ci.detail or '', ''})
+          end
+          local sel = -1
+          local selected = cmp.get_selected_entry()
+          if selected then
+            for i, entry in ipairs(entries) do
+              if entry == selected then sel = i - 1; break end
+            end
+          end
+          return {items, sel}
+        `, []]) as [unknown[][], number] | null;
+
+        if (cmpState) {
+          this.pmenuItems = (cmpState[0] as unknown[][]).map(
+            (item) => [String(item[0]), String(item[1]), String(item[2]), String(item[3])] as [string, string, string, string],
+          );
+          this.pmenuSelected = cmpState[1] as number;
+          this.pmenuVisible = true;
+          this.pmenuSource = "cmp";
+        } else if (this.pmenuSource === "cmp") {
+          this.pmenuVisible = false;
+          this.pmenuItems = [];
+          this.pmenuSelected = -1;
+          this.pmenuSource = null;
+        }
+      } catch {
+        // nvim-cmp not installed or errored — fall back to ext_popupmenu events
+      }
+
       // Check for yanked text and copy to tmux
       if (this.settings.tmux.clipboard) {
         try {
@@ -643,6 +918,46 @@ class NvimEditor extends CustomEditor {
       this.nLines = lines;
       this.pushToEditor();
     }).catch(() => {});
+  }
+
+  /** Splice `content` into `rendered` at visible column `col`, replacing `contentWidth` visible characters. */
+  private spliceAtCol(rendered: string, col: number, content: string, contentWidth: number): string {
+    let visPos = 0;
+    let beforePopup = "";
+    let afterPopup = "";
+    let phase: "before" | "skip" | "after" = "before";
+    let skipped = 0;
+
+    for (let j = 0; j < rendered.length; ) {
+      if (rendered[j] === "\x1b") {
+        let end = j + 1;
+        if (rendered[end] === "[") {
+          while (end < rendered.length && rendered[end] !== "m") end++;
+          end++;
+        } else if (rendered[end] === "_") {
+          while (end < rendered.length && rendered[end] !== "\x07") end++;
+          end++;
+        } else {
+          end++;
+        }
+        const seq = rendered.slice(j, end);
+        if (phase === "before") beforePopup += seq;
+        else afterPopup += seq;
+        j = end;
+        continue;
+      }
+
+      if (phase === "before" && visPos >= col) phase = "skip";
+      if (phase === "skip" && skipped >= contentWidth) phase = "after";
+
+      if (phase === "before") { beforePopup += rendered[j]; visPos++; }
+      else if (phase === "skip") { skipped++; visPos++; }
+      else { afterPopup += rendered[j]; visPos++; }
+      j++;
+    }
+
+    while (visibleWidth(beforePopup) < col) beforePopup += " ";
+    return beforePopup + content + afterPopup;
   }
 
   // ── render (add mode label) ────────────────────────────────────────
@@ -714,19 +1029,132 @@ class NvimEditor extends CustomEditor {
           }
           // Visible character
           if (visPos >= selStart && visPos < selEnd && !inHighlight) {
-            result += "\x1b[47m";
+            result += this.visualStyle.on;
             inHighlight = true;
           }
           if (visPos >= selEnd && inHighlight) {
-            result += "\x1b[49m";
+            result += this.visualStyle.off;
             inHighlight = false;
           }
           result += rendered[j];
           visPos++;
           j++;
         }
-        if (inHighlight) result += "\x1b[49m";
+        if (inHighlight) result += this.visualStyle.off;
         lines[renderIdx] = result;
+      }
+    }
+
+    // Render ghost text (inline completion) — hide when popup menu is open
+    if (this.ghostLines.length > 0 && mode === "insert" && !this.pmenuVisible) {
+      const ghostOn = "\x1b[2;3m";
+      const ghostOff = "\x1b[22;23m";
+      const padX = this.getPaddingX();
+      const cursorRenderIdx = this.nCursorRow;
+
+      if (cursorRenderIdx > 0 && cursorRenderIdx < lines.length - 1) {
+        const col = padX + this.nCursorCol;
+        const maxGhostWidth = width - col;
+        if (maxGhostWidth > 0) {
+          const truncGhost = truncateToWidth(this.ghostLines[0]!, maxGhostWidth);
+          const styledGhost = `${ghostOn}${truncGhost}${ghostOff}`;
+          const spliced = this.spliceAtCol(lines[cursorRenderIdx]!, col, styledGhost, 0);
+          lines[cursorRenderIdx] = truncateToWidth(spliced, width);
+
+          for (let g = 1; g < this.ghostLines.length; g++) {
+            const truncLine = truncateToWidth(this.ghostLines[g]!, width - padX);
+            const ghostLine = " ".repeat(padX) + `${ghostOn}${truncLine}${ghostOff}`;
+            const padRight = " ".repeat(Math.max(0, width - visibleWidth(ghostLine)));
+            lines.splice(cursorRenderIdx + g, 0, ghostLine + padRight);
+          }
+        }
+      }
+    }
+
+    // Render popup menu overlay
+    if (this.pmenuVisible && this.pmenuItems.length > 0) {
+      const MAX_VISIBLE = 10;
+      const items = this.pmenuItems;
+      const sel = this.pmenuSelected;
+
+      // Scroll window: keep selected item visible
+      let scrollTop = 0;
+      if (sel >= 0) {
+        if (sel >= scrollTop + MAX_VISIBLE) scrollTop = sel - MAX_VISIBLE + 1;
+        if (sel < scrollTop) scrollTop = sel;
+      }
+      const visibleItems = items.slice(scrollTop, scrollTop + MAX_VISIBLE);
+      const hasScrollIndicator = items.length > MAX_VISIBLE;
+      const popupHeight = visibleItems.length + (hasScrollIndicator ? 1 : 0);
+
+      // Compute max column widths for alignment
+      let maxWord = 0;
+      let maxKind = 0;
+      let maxMenu = 0;
+      for (const item of visibleItems) {
+        if (item[0].length > maxWord) maxWord = item[0].length;
+        if (item[1].length > maxKind) maxKind = item[1].length;
+        if (item[2].length > maxMenu) maxMenu = item[2].length;
+      }
+      const popupInnerWidth = Math.min(
+        maxWord + (maxKind ? maxKind + 1 : 0) + (maxMenu ? maxMenu + 2 : 0) + 2,
+        width - 4,
+      );
+      const popupWidth = popupInnerWidth;
+
+      // Popup position: below cursor row. Content starts at render index 1 (after top border).
+      const popupStartRow = this.nCursorRow + 1;
+      const popupCol = Math.min(this.nCursorCol + 1, width - popupWidth - 1);
+
+      // Inject blank lines before the bottom border if the popup extends past content
+      const bottomBorderIdx = lines.length - 1;
+      const popupEndRow = popupStartRow + popupHeight;
+      if (popupEndRow > bottomBorderIdx) {
+        const extraLines = popupEndRow - bottomBorderIdx;
+        const blankLine = " ".repeat(width);
+        for (let e = 0; e < extraLines; e++) {
+          lines.splice(bottomBorderIdx, 0, blankLine);
+        }
+      }
+
+      for (let i = 0; i < visibleItems.length; i++) {
+        const renderIdx = popupStartRow + i;
+        if (renderIdx <= 0 || renderIdx >= lines.length - 1) continue;
+
+        const [word, kind, menu] = visibleItems[i]!;
+        const isSelected = (scrollTop + i) === sel;
+        const ps = this.pmenuStyle;
+
+        const wordPad = " ".repeat(Math.max(0, maxWord - word.length));
+        const kindPart = maxKind > 0 ? ` ${(kind || "").padEnd(maxKind)}` : "";
+        const menuPart = maxMenu > 0 ? ` ${(menu || "").padEnd(maxMenu)}` : "";
+
+        const leftText = `${word}${wordPad}${kindPart}`;
+        const leftTrunc = leftText.slice(0, popupWidth);
+        const menuTrunc = menuPart.slice(0, Math.max(0, popupWidth - visibleWidth(leftTrunc)));
+        const remaining = popupWidth - visibleWidth(leftTrunc) - visibleWidth(menuTrunc);
+        const pad = " ".repeat(Math.max(0, remaining));
+
+        const wordStyle = isSelected ? ps.selected : ps.normal;
+        const kindStyle = isSelected ? ps.kindSelected : ps.kindNormal;
+        const styledItem = `${wordStyle}${leftTrunc}${ps.reset}${kindStyle}${pad}${menuTrunc}${ps.reset}`;
+
+        lines[renderIdx] = this.spliceAtCol(lines[renderIdx]!, popupCol, styledItem, popupWidth);
+      }
+
+      // Scroll indicator
+      if (hasScrollIndicator) {
+        const indicatorRow = popupStartRow + visibleItems.length;
+        if (indicatorRow > 0 && indicatorRow < lines.length - 1) {
+          const remaining = items.length - scrollTop - MAX_VISIBLE;
+          const scrollInfo = remaining > 0
+            ? ` +${remaining} more `
+            : ` ${items.length} items `;
+          const info = truncateToWidth(scrollInfo, popupWidth);
+          const padded = info + " ".repeat(Math.max(0, popupWidth - visibleWidth(info)));
+          const styledInfo = `\x1b[2m${this.pmenuStyle.normal}${padded}${this.pmenuStyle.reset}\x1b[22m`;
+          lines[indicatorRow] = this.spliceAtCol(lines[indicatorRow]!, popupCol, styledInfo, popupWidth);
+        }
       }
     }
 
@@ -739,7 +1167,22 @@ class NvimEditor extends CustomEditor {
     const label = colorize ? colorize(rawLabel) : rawLabel;
 
     const last = lines.length - 1;
-    if (visibleWidth(lines[last]!) >= visibleWidth(rawLabel)) {
+
+    // Show message from neovim (print/echo/errors) on the bottom border line
+    if (this.msgText) {
+      const isError = this.msgKind === "emsg" || this.msgKind === "echoerr" || this.msgKind === "lua_error";
+      const msgColor = isError ? "\x1b[31m" : "\x1b[2m";
+      const maxMsgWidth = width - visibleWidth(rawLabel) - 2;
+      const msgDisplay = ` ${truncateToWidth(this.msgText, maxMsgWidth, "…")} `;
+      const styledMsg = `${msgColor}${msgDisplay}\x1b[0m`;
+      const labelWidth = visibleWidth(rawLabel);
+      const msgWidth = visibleWidth(msgDisplay);
+      if (visibleWidth(lines[last]!) >= labelWidth + msgWidth) {
+        lines[last] = truncateToWidth(lines[last]!, width - labelWidth - msgWidth, "") + styledMsg + label;
+      } else {
+        lines[last] = truncateToWidth(lines[last]!, width - visibleWidth(rawLabel), "") + label;
+      }
+    } else if (visibleWidth(lines[last]!) >= visibleWidth(rawLabel)) {
       lines[last] = truncateToWidth(lines[last]!, width - visibleWidth(rawLabel), "") + label;
     }
 
@@ -749,6 +1192,44 @@ class NvimEditor extends CustomEditor {
     setImmediate(() => process.stdout.write(shape));
     return lines;
   }
+}
+
+// ── Pi command collection ─────────────────────────────────────────────
+
+const BUILTIN_COMMANDS: { name: string; description: string }[] = [
+  { name: "settings", description: "Open settings menu" },
+  { name: "model", description: "Select model (opens selector UI)" },
+  { name: "scoped-models", description: "Enable/disable models for Ctrl+P cycling" },
+  { name: "export", description: "Export session (HTML default, or specify path)" },
+  { name: "import", description: "Import and resume a session from a JSONL file" },
+  { name: "share", description: "Share session as a secret GitHub gist" },
+  { name: "copy", description: "Copy last agent message to clipboard" },
+  { name: "name", description: "Set session display name" },
+  { name: "session", description: "Show session info and stats" },
+  { name: "changelog", description: "Show changelog entries" },
+  { name: "hotkeys", description: "Show all keyboard shortcuts" },
+  { name: "fork", description: "Create a new fork from a previous message" },
+  { name: "tree", description: "Navigate session tree (switch branches)" },
+  { name: "login", description: "Login with OAuth provider" },
+  { name: "logout", description: "Logout from OAuth provider" },
+  { name: "new", description: "Start a new session" },
+  { name: "compact", description: "Manually compact the session context" },
+  { name: "resume", description: "Resume a different session" },
+  { name: "reload", description: "Reload keybindings, extensions, skills, prompts, and themes" },
+  { name: "quit", description: "Quit pi" },
+];
+
+function collectPiCommands(pi: ExtensionAPI): { name: string; description: string }[] {
+  const builtinNames = new Set(BUILTIN_COMMANDS.map(c => c.name));
+  const commands = [...BUILTIN_COMMANDS];
+  try {
+    for (const cmd of pi.getCommands()) {
+      if (!builtinNames.has(cmd.name)) {
+        commands.push({ name: cmd.name, description: cmd.description ?? "" });
+      }
+    }
+  } catch {}
+  return commands;
 }
 
 // ── Extension entry point ─────────────────────────────────────────────
@@ -805,9 +1286,10 @@ export default function (pi: ExtensionAPI) {
       : null;
 
     const s = settings;
+    const piCommands = collectPiCommands(pi);
     ctx.ui.setEditorComponent((tui, theme, kb) => {
       if (currentEditor) currentEditor.close();
-      const editor = new NvimEditor(tui, theme, kb, colorizers, s);
+      const editor = new NvimEditor(tui, theme, kb, colorizers, s, piCommands);
       currentEditor = editor;
       return editor;
     });
@@ -821,10 +1303,11 @@ export default function (pi: ExtensionAPI) {
     inputUnsub = ctx.ui.onTerminalInput((data: string) => {
       // Keys that pi's base editor consumes before our handleInput sees them.
       // Intercept here and forward to our editor directly.
+      // Skip when an overlay is active (model picker, session picker, etc.)
       if (matchesKey(data, "backspace") || data === "\x7f" || data === "\x08"
         || matchesKey(data, "tab") || data === "\t"
         || matchesKey(data, "shift+tab")) {
-        if (currentEditor) {
+        if (currentEditor && (currentEditor as any).focused) {
           currentEditor.handleInput(data);
           return { consume: true };
         }
