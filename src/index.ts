@@ -210,40 +210,73 @@ class NvimEditor extends CustomEditor {
         end
       `, []]);
 
-      // Register nvim-cmp source for pi slash commands
+      // Register nvim-cmp source for pi slash commands (deferred until cmp loads)
       const cmdsJson = JSON.stringify(this.piCommands);
       const cmpSourceLua = [
-        "local ok, cmp = pcall(require, 'cmp')",
-        "if not ok then return end",
-        "local commands = vim.fn.json_decode(...) or {}",
-        "local source = {}",
-        "source.new = function() return setmetatable({}, { __index = source }) end",
-        "function source:get_trigger_characters() return { '/' } end",
-        "function source:get_keyword_pattern() return [[/\\S*]] end",
-        "function source:complete(params, callback)",
-        "  local line = params.context.cursor_before_line",
-        "  if not line:match('^%s*/') then",
-        "    callback({ items = {}, isIncomplete = false })",
-        "    return",
+        "local cmds_json = select(1, ...)",
+        "",
+        "local function register_pi_source()",
+        "  local ok, cmp = pcall(require, 'cmp')",
+        "  if not ok then return false end",
+        "  ",
+        "  local decode_ok, commands = pcall(vim.json.decode, cmds_json)",
+        "  if not decode_ok then commands = {} end",
+        "",
+        "  local source = {}",
+        "  source.new = function() return setmetatable({}, { __index = source }) end",
+        "  function source:get_trigger_characters() return { '/' } end",
+        "  function source:get_keyword_pattern() return [[/\\S*]] end",
+        "  function source:complete(params, callback)",
+        "    local line = params.context.cursor_before_line",
+        "    if not line:match('^/') then",
+        "      callback({ items = {}, isIncomplete = false })",
+        "      return",
+        "    end",
+        "    local items = {}",
+        "    for _, cmd in ipairs(commands) do",
+        "      items[#items + 1] = {",
+        "        label = '/' .. cmd.name,",
+        "        kind = 14,",
+        "        detail = cmd.description or '',",
+        "        filterText = '/' .. cmd.name,",
+        "        sortText = cmd.name,",
+        "      }",
+        "    end",
+        "    callback({ items = items, isIncomplete = false })",
         "  end",
-        "  local items = {}",
-        "  for _, cmd in ipairs(commands) do",
-        "    items[#items+1] = {",
-        "      label = '/' .. cmd.name,",
-        "      kind = 14,",
-        "      detail = cmd.description or '',",
-        "      filterText = '/' .. cmd.name,",
-        "      sortText = cmd.name,",
-        "    }",
+        "",
+        "  cmp.register_source('pi', source)",
+        "",
+        "  local cfg = require('cmp.config')",
+        "  local global = cfg.get()",
+        "  local existing = global.sources or {}",
+        "  local filtered = {}",
+        "  for _, s in ipairs(existing) do",
+        "    if s.name ~= 'pi' then filtered[#filtered + 1] = s end",
         "  end",
-        "  callback({ items = items, isIncomplete = false })",
+        "  table.insert(filtered, 1, { name = 'pi', group_index = 0 })",
+        "  cmp.setup({ sources = filtered })",
+        "",
+
+        "  return true",
         "end",
-        "cmp.register_source('pi', source)",
-        "local config = require('cmp.config')",
-        "local global = config.get()",
-        "local sources = global.sources or {}",
-        "table.insert(sources, 1, { name = 'pi' })",
-        "cmp.setup({ sources = sources })",
+        "",
+        "-- Try now, otherwise wait for VeryLazy / InsertEnter",
+        "if register_pi_source() then return end",
+        "vim.api.nvim_create_autocmd('User', {",
+        "  pattern = 'VeryLazy',",
+        "  once = true,",
+        "  callback = function()",
+        "    if not register_pi_source() then",
+        "      vim.api.nvim_create_autocmd('InsertEnter', {",
+        "        once = true,",
+        "        callback = function()",
+        "          register_pi_source()",
+        "        end,",
+        "      })",
+        "    end",
+        "  end,",
+        "})",
       ].join("\n");
       await this.nvim.request("nvim_exec_lua", [cmpSourceLua, [cmdsJson]]);
 
@@ -468,7 +501,7 @@ class NvimEditor extends CustomEditor {
   }
 
   // Keys bypassed to pi (used by pump + batch check)
-  private static readonly PI_KEYS = ["ctrl+d", "alt+up", "alt+return"];
+  private static readonly PI_KEYS = ["ctrl+d", "ctrl+o", "alt+up", "alt+return"];
 
   /** Merged tmux keys from settings (paneKeys + extraKeys). */
   private get tmuxKeys(): Record<string, string[]> {
@@ -825,11 +858,13 @@ class NvimEditor extends CustomEditor {
           for _, entry in ipairs(entries) do
             local ci = entry:get_completion_item()
             local kind = ''
-            if ci.kind then
+            if entry.source.name == 'pi' then
+              kind = 'pi'
+            elseif ci.kind then
               local names = vim.lsp.protocol.CompletionItemKind
               if type(names) == 'table' then kind = names[ci.kind] or '' end
             end
-            table.insert(items, {ci.label or '', kind, ci.detail or '', ''})
+            table.insert(items, {ci.label or '', '[' .. kind .. ']', ci.detail or '', ''})
           end
           local sel = -1
           local selected = cmp.get_selected_entry()
@@ -965,6 +1000,9 @@ class NvimEditor extends CustomEditor {
   render(width: number): string[] {
     const lines = super.render(width);
     if (lines.length === 0) return lines;
+
+    // OSC 133;D (command finished) + 133;A (prompt start) — enables tmux K/J prompt navigation
+    lines[0] = "\x1b]133;D\x07\x1b]133;A\x07" + lines[0];
 
     const IS_BORDER_LINE = /^([^─]*─){6,}/;
     for (let i = 0; i < lines.length; i++) {
@@ -1241,6 +1279,47 @@ export default function (pi: ExtensionAPI) {
   let pendingEscTimer: ReturnType<typeof setTimeout> | null = null;
   let settings: NvimEmbeddedSettings | null = null;
 
+  // Tmux prompt tracking (mirrors zsh __prompt_precmd for J/K navigation)
+  let promptCount = 0;
+  let promptLookupMax = 0;
+
+  function generateLookupFmt(n: number): string {
+    const cur = "#{e|+|:#{e|-|:#{history_size},#{scroll_position}},#{copy_cursor_y}}";
+    let result = "0";
+    for (let i = 1; i <= n; i++) {
+      result = `#{?#{&&:#{@prompt_line_${i}},#{e|<=|:#{@prompt_line_${i}},${cur}}},${i},${result}}`;
+    }
+    return result;
+  }
+
+  function updateTmuxPromptVars(tmuxBin: string): void {
+    if (!process.env.TMUX) return;
+    promptCount++;
+    execFile(tmuxBin, ["display-message", "-p", "#{e|+|:#{e|+|:#{history_size},#{cursor_y}},1}"], (err, stdout) => {
+      if (err || !stdout.trim()) return;
+      const line = stdout.trim();
+      execFile(tmuxBin, ["set", "-p", `@prompt_line_${promptCount}`, line], () => {});
+      execFile(tmuxBin, ["set", "-p", "@prompt_total", String(promptCount)], () => {});
+      if (promptCount > promptLookupMax) {
+        const newMax = (Math.floor(promptCount / 50) + 1) * 50;
+        execFile(tmuxBin, ["set", "-p", "@prompt_lookup_fmt", generateLookupFmt(newMax)], () => {});
+        promptLookupMax = newMax;
+      }
+    });
+  }
+
+  function initTmuxPromptCount(tmuxBin: string): void {
+    if (!process.env.TMUX) return;
+    execFile(tmuxBin, ["display-message", "-p", "#{@prompt_total}"], (err, stdout) => {
+      if (err) return;
+      const total = parseInt(stdout.trim(), 10);
+      if (!isNaN(total) && total > 0) {
+        promptCount = total;
+        promptLookupMax = (Math.floor(total / 50) + 1) * 50;
+      }
+    });
+  }
+
   function hasRunningOperations(): boolean {
     const g = globalThis as any;
     if (typeof g.__piHasRunningSubagents === "function" && g.__piHasRunningSubagents()) return true;
@@ -1267,6 +1346,7 @@ export default function (pi: ExtensionAPI) {
 
   pi.on("agent_end", async (_event, ctx) => {
     if (ctx.hasUI) ctx.ui.setStatus("esc-hint", undefined);
+    if (settings) updateTmuxPromptVars(settings.tmux.binary);
   });
 
   pi.on("session_start", async (_event, ctx) => {
@@ -1274,6 +1354,8 @@ export default function (pi: ExtensionAPI) {
     lastEscTime = 0;
 
     if (!settings) settings = await loadSettings();
+    initTmuxPromptCount(settings.tmux.binary);
+    updateTmuxPromptVars(settings.tmux.binary);
     cursorInsert = settings.cursor.insert;
     cursorNormal = settings.cursor.normal;
 

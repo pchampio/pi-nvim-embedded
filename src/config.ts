@@ -17,7 +17,7 @@ const DEFAULT_TMUX_PANE_KEYS: Record<string, string[]> = {
 };
 
 const DEFAULT_TMUX_EXTRA_KEYS: Record<string, string[]> = {
-  "alt+k": ["copy-mode", "-H"],
+  "alt+k": ["copy-mode", "-H", ";", "send-keys", "-X", "cursor-up"],
 };
 
 async function readConfigFile(): Promise<{ config: NvimEmbeddedConfigFile; error?: string }> {
